@@ -1,0 +1,11 @@
+{
+  "name": "visual",
+  "displayName": "Visual",
+  "version": "0.4.1",
+  "description": "Explain something from your Claude Code session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
+  "author": {
+    "name": "Visual Understanding"
+  },
+  "homepage": "https://beta.visualunderstanding.ai",
+  "keywords": ["visual", "explain", "teaching", "whiteboard"]
+}

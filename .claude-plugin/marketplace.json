@@ -1,0 +1,15 @@
+{
+  "name": "visual-understanding",
+  "description": "Visual Understanding plugins for Claude Code",
+  "owner": {
+    "name": "Visual Understanding"
+  },
+  "plugins": [
+    {
+      "name": "visual",
+      "source": "./plugins/visual",
+      "description": "Explain something from your Claude Code session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
+      "version": "0.4.1"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "description": "Ask before an answer from this session is sent to Visual; leave Visual when the session ends",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs\" hook", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs\" session-end", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
