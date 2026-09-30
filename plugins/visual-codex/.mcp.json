@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "visual": {
+      "command": "node",
+      "args": ["./bin/visual-mcp.mjs"],
+      "cwd": ".",
+      "env_vars": ["VISUAL_API_URL", "VISUAL_WEB_URL", "VISUAL_BRIDGE_NO_OPEN", "CODEX_BIN", "CODEX_HOME"],
+      "tool_timeout_sec": 60,
+      "default_tools_approval_mode": "approve",
+      "tools": {
+        "visual_reply": {
+          "approval_mode": "prompt"
+        }
+      }
+    }
+  }
+}
