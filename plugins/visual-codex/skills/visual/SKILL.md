@@ -12,21 +12,25 @@ If the request starts with the word `new` or contains `--new`, the user wants a 
 word from the request and pass `new: true` in step 2. Otherwise a repeated `$visual` in this thread continues in
 the Visual chat it opened before, even if that tab or Codex was closed in between.
 
-## 1. Write the brief: the relevant facts (a few minutes at most)
+## 1. Write the brief like a pull request description (a few minutes at most)
 
-Visual does the teaching and the storytelling; your job is only to hand over the relevant facts. Read what you
-need first (`git show`, `git log`, the files involved, this conversation), then write a plain, factual description.
-Keep it under ~8,000 characters:
+Visual explains it top-down, the way a teammate walks someone through a pull request: the big picture, then
+each piece and why it is needed. Your job is to hand over that description, accurately. Read what you need first
+(`git show`, `git log`, the files involved, this conversation), then write it in plain words. Keep it under ~8,000
+characters:
 
 - **The request:** what they asked, and what they seem to want to understand if this conversation shows it.
-- **What changed:** the change described in plain words, part by part (which components or files, what each does now).
-- **Why:** the reason or problem behind it, if the commit message, history or conversation says so.
-- **Behaviour before and after:** how it worked before and how it works now, stated as facts.
-- **Effects:** what a user or teammate would notice, plus risks or edge cases you verified.
+- **The change in one line:** what it achieves.
+- **Why:** the problem or reason behind it (from the commit message, history or conversation), and how things
+  behaved before versus after.
+- **The conceptual changes:** the two to four ideas that make up the change, each with why it was needed.
+- **The concrete changes, file by file:** for each file or module touched, what it is for, what changed in it, and
+  why that change is needed (which idea above it serves). For a plan document: each part of the plan, what it
+  touches, and why.
+- **Effects and risks:** what a user or teammate would notice, edge cases or follow-ups you verified.
 - **Key facts:** names, numbers, limits and timings you checked. Mark anything you are not sure of as unsure.
-- Optional: up to three `file:line` pointers. No diffs or code listings.
 
-Don't add analogies, stories or teaching advice. Visual can ask this session for more at any time. Never put
+No diffs or code listings, and no analogies or stories. Visual can ask this session for more at any time. Never put
 secrets, keys or `.env` contents in the brief.
 
 ## 2. Open Visual

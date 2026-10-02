@@ -1,7 +1,7 @@
 {
   "name": "visual",
   "displayName": "Visual",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Explain something from your Claude Code session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
   "author": {
     "name": "Visual Understanding"
