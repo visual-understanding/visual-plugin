@@ -1,6 +1,6 @@
 {
   "name": "visual",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Explain something from your Codex session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
   "author": {
     "name": "Visual Understanding"

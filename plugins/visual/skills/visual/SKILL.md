@@ -17,16 +17,24 @@ if that tab or Claude Code was closed in between.
 The bridge script is `${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs` (Node 22+, no install needed).
 Below, `BRIDGE` stands for `node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs`; write the full command every time.
 
-## 1. Write a short brief (quick, under a minute)
+## 1. Write the brief: the relevant facts (a few minutes at most)
 
-Collect only the essentials Visual needs to start explaining, and write them to a temp file,
-for example `/tmp/visual-brief-${CLAUDE_SESSION_ID}.md` (or your scratchpad directory). Keep it under ~20,000 characters.
+Write it to a temp file, for example `/tmp/visual-brief-${CLAUDE_SESSION_ID}.md` (or your scratchpad directory).
 
-- A commit: `git show --stat --format=fuller <rev>`, then the most relevant hunks (`git show <rev> -- <paths>`), trimmed.
-- Uncommitted work: `git status --short` and the key parts of `git diff`.
-- A concept or subsystem: the few key file excerpts, each headed with its path and line range.
+Visual does the teaching and the storytelling; your job is only to hand over the relevant facts. Read what you
+need first (`git show`, `git log`, the files involved, this conversation), then write a plain, factual description.
+Keep it under ~8,000 characters:
 
-Don't over-research: Visual can ask this session for more at any time. Never put secrets, keys or `.env` contents in the brief.
+- **The request:** what they asked, and what they seem to want to understand if this conversation shows it.
+- **What changed:** the change described in plain words, part by part (which components or files, what each does now).
+- **Why:** the reason or problem behind it, if the commit message, history or conversation says so.
+- **Behaviour before and after:** how it worked before and how it works now, stated as facts.
+- **Effects:** what a user or teammate would notice, plus risks or edge cases you verified.
+- **Key facts:** names, numbers, limits and timings you checked. Mark anything you are not sure of as unsure.
+- Optional: up to three `file:line` pointers. No diffs or code listings.
+
+Don't add analogies, stories or teaching advice. Visual can ask this session for more at any time. Never put
+secrets, keys or `.env` contents in the brief.
 
 ## 2. Start the bridge
 
@@ -88,8 +96,9 @@ node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs decline <questionId> --id <brid
 
 Never retry a reply the user denied, and never send its content another way.
 
-Answers are concise and factual: exact code snippets with file paths and line numbers when code is asked for,
-the actual reason behind a decision when it is in the transcript or history, and "I don't know" rather than a guess.
+Answers are concise, factual and in plain language: what happens, in what order and why, as a person would
+explain it to a teammate. Include code only when Visual explicitly asks for it, and the actual reason behind a
+decision when it is in the transcript or history. Say "I don't know" or "not sure" rather than guess.
 Aim for a few thousand characters at most. Don't narrate the answer to the user; at most one short line such as
 "Answered Visual: where the registry lives".
 
