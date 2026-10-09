@@ -60,3 +60,31 @@ claude plugin uninstall visual@visual-understanding   # Claude Code
 codex plugin remove visual@visual-understanding       # Codex
 rm -rf ~/.visual-bridge
 ```
+
+## Codex change requests (zero point five)
+
+Visual has two separate tools: `visual_ask` requests read-only clarification;
+`visual_send` drafts or revises a change request on the board. Review and edit
+its exact task, then click **Send to Codex**. **Revise** asks Visual to change it;
+**Don't send**, or telling Visual not to send, dismisses an unsent draft.
+Model output, narration, and replay cannot confirm a task.
+
+The `visual-update` skill claims the confirmed request from the local inbox,
+works in the connected Codex thread under its existing permissions and mode,
+and reports progress. Plan mode produces a plan and **Needs attention**.
+Commits, pushes, deployments, and unrelated changes are not implied.
+Only one update can be active per thread. Stop a running task in Codex.
+
+The board preserves progress and results across reconnects and reopening.
+**Explain changes** starts a normal Visual request when clicked; completion
+does not interrupt a lesson. Results use the same local sharing approval as
+read-only answers. Declining result sharing sends only a fixed notice.
+
+Local MCP tools: `visual_update_claim` (verified task, once),
+`visual_update_status` (fixed progress values), and `visual_update_result`
+(approved summary). Private durable receipts live under
+`~/.visual-bridge/updates/` (`~/.visual-bridge-local/updates/` for the local lab).
+If delivery becomes uncertain, inspect the existing request in Codex with
+`visual_status`; do not create a replacement automatically. Already claimed
+requests never execute again. Claude Code and older Codex plugins remain
+read-only and do not expose the update action.
