@@ -17,33 +17,42 @@ if that tab or Claude Code was closed in between.
 The bridge script is `${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs` (Node 22+, no install needed).
 Below, `BRIDGE` stands for `node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs`; write the full command every time.
 
-## 1. Write the brief like a pull request description (a few minutes at most)
+## 1. Session context
 
-Write it to a temp file, for example `/tmp/visual-brief-${CLAUDE_SESSION_ID}.md` (or your scratchpad directory).
+The handoff contains chronological user request / factual summary pairs, followed by the current
+Visual request and the supporting details needed to explain it. Visual selects relevant pairs with Jev.
+The JSON context contract is:
 
-Visual explains it top-down, the way a teammate walks someone through a pull request: the big picture, then
-each piece and why it is needed. Your job is to hand over that description, accurately. Read what you need first
-(`git show`, `git log`, the files involved, this conversation), then write it in plain words. Keep it under ~8,000
-characters:
+```json
+{
+  "history": [
+    {"id": "r1", "request": "The user's original request", "summary": "Verified outcome, decisions, or unresolved work"},
+    {"id": "r2", "request": "A later correction", "summary": "What changed", "relatedTo": ["r1"]}
+  ],
+  "details": "Relevant verified facts, useful source excerpts, paths, and uncertainties for the current request",
+  "omitted": false
+}
+```
 
-- **The request:** what they asked, and what they seem to want to understand if this conversation shows it.
-- **The change in one line:** what it achieves.
-- **Why:** the problem or reason behind it (from the commit message, history or conversation), and how things
-  behaved before versus after.
-- **The conceptual changes:** the two to four ideas that make up the change, each with why it was needed.
-- **The concrete changes, file by file:** for each file or module touched, what it is for, what changed in it, and
-  why that change is needed (which idea above it serves). For a plan document: each part of the plan, what it
-  touches, and why.
-- **Effects and risks:** what a user or teammate would notice, edge cases or follow-ups you verified.
-- **Key facts:** names, numbers, limits and timings you checked. Mark anything you are not sure of as unsure.
+`history` contains the available session requests, ordered oldest first. IDs are unique. `relatedTo` links a correction or constraint to the
+requests it affects; those entries stay together during relevance selection. Each request and summary
+allows up to eight thousand characters. The total history budget is eighty thousand characters;
+older entries are omitted when it is exceeded. `details` allows thirty thousand characters.
+`omitted` indicates missing earlier history, including conversation compaction.
 
-No diffs or code listings, and no analogies or stories. Visual can ask this session for more at any time. Never put
-secrets, keys or `.env` contents in the brief.
+- Don't replace the user's intent with a guessed goal or a prescribed lesson structure.
+- Don't present unverified outcomes or guesses as facts, or summarize planned work as completed.
+- Don't pre-filter the history by relevance; Jev handles selection.
+- Don't lose later corrections or constraints when summarizing earlier requests.
+- Don't include secrets, credentials, or `.env` contents.
+- Don't write the lesson, narration, or visual directions into the handoff.
+
+Write this JSON to a temporary context file, such as `/tmp/visual-context-${CLAUDE_SESSION_ID}.json`.
 
 ## 2. Start the bridge
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start --session ${CLAUDE_SESSION_ID} --brief <brief file> --prompt '<the request>' [--new]
+node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start --session ${CLAUDE_SESSION_ID} --context <context JSON file> --prompt '<the request>' [--new]
 ```
 
 Single-quote the prompt (escape any `'` inside it as `'\''`). It prints one line and exits while a background

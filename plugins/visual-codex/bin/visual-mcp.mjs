@@ -13,6 +13,7 @@
 //
 // Visual's questions reach the thread with `codex queue --thread <threadId> --message <text>`.
 // This file is self-contained: the plugin folder is copied into Codex's cache, so it imports nothing outside it.
+import { readContext, CONTEXT_SCHEMA } from './context-data.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -232,8 +233,8 @@ function removeLink(key, linkId) {
   rmSync(linkPath(key), { force: true });
 }
 const newLink = () => ({ linkId: randomUUID(), secret: randomBytes(32).toString('base64url'), chatId: null, createdAt: new Date().toISOString() });
-const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '' }) =>
-  ({ type: 'rejoin', version: 1, agent: AGENT, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript });
+const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '', context }) =>
+  ({ type: 'rejoin', version: 1, agent: AGENT, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript, ...(context ? { context } : {}) });
 
 // ---------------------------------------------------------------- browser, codex queue
 
@@ -409,13 +410,14 @@ class Connection {
   }
 
   /** A new request for the chat this connection already has; resolves with the ack or null. */
-  request(prompt, brief) {
+  request(prompt, brief, context, transcript) {
     const id = randomBytes(12).toString('base64url');
     const ack = new Promise((done) => {
       this.requests.set(id, done);
       setTimeout(() => { if (this.requests.delete(id)) done(null); }, 5000).unref?.();
     });
-    if (!this.send({ type: 'request', id, prompt, brief })) { this.requests.delete(id); return Promise.resolve(null); }
+    if (!this.send({ type: 'request', id, prompt, brief, ...(context ? { context } : {}), transcript })) { this.requests.delete(id); return Promise.resolve(null); }
+    Object.assign(this.hello, { prompt, brief, context, transcript });
     this.lastActivity = Date.now();
     return ack;
   }
@@ -444,7 +446,7 @@ class Connection {
       const hello = { type: 'hello', version: 1, agent: AGENT, ...this.hello };
       return this.link ? { ...hello, link: { id: this.link.linkId, secret: this.link.secret } } : hello;
     }
-    if (this.link && (this.chatId || !this.secret)) return rejoinFrame(this.link, { title: this.hello.title, cwd: this.hello.cwd });
+    if (this.link && (this.chatId || !this.secret)) return rejoinFrame(this.link, { ...this.hello, prompt: '' });
     return { type: 'resume', bridgeId: this.bridgeId, secret: this.secret };
   }
 
@@ -512,9 +514,11 @@ async function visualOpen(threadId, args) {
   const prompt = clip(cleanText(args.request), LIMITS.prompt);
   if (!prompt) throw new Error('visual_open needs a non-empty "request".');
   if (args.brief !== undefined && typeof args.brief !== 'string') throw new Error('"brief" must be text.');
-  const brief = clip(String(args.brief ?? '').replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]');
+  const handoff = readContext(args.context);
+  const brief = handoff ? handoff.details : clip(String(args.brief ?? '').replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]');
   const key = linkKey(threadId);
   const context = sessionContext(threadId);
+  const transcript = handoff ? '' : context.transcript;
   let conn = liveConnection(threadId);
   let link = loadLink(key);
 
@@ -528,7 +532,7 @@ async function visualOpen(threadId, args) {
   } else if (conn) {
     // (1) This thread's connection is live: ask in the Visual chat it already has.
     if (conn.connected && conn.claimed) {
-      const ack = await conn.request(prompt, brief);
+      const ack = await conn.request(prompt, brief, handoff, transcript);
       if (ack?.accepted) return reusedText(conn.chatId || ack.chatId, !!ack.open);
     }
     // Never claimed: nothing to come back to, so start afresh. Otherwise (not connected now) rejoin below.
@@ -538,7 +542,7 @@ async function visualOpen(threadId, args) {
     if (forget && link?.linkId === conn.bridgeId) { removeLink(key, link.linkId); link = null; }
   }
 
-  const hello = { title: context.title, cwd: context.cwd, prompt, brief, transcript: context.transcript };
+  const hello = { title: context.title, cwd: context.cwd, prompt, brief, transcript, ...(handoff ? { context: handoff } : {}) };
   if (link) {
     // (2) This thread had a Visual chat: rejoin it with the new request, no connect page.
     const rejoining = track(new Connection({ threadId, hello, link, mode: 'rejoin', onEnd: untrack }));
@@ -589,12 +593,13 @@ export const TOOLS = [
   {
     name: 'visual_open',
     title: 'Open in Visual',
-    description: 'Open (or continue) this Codex thread\'s Visual chat with a request, a short brief and the thread transcript. The first call opens a connect page in the browser; later calls continue in the same chat. Pass new: true to start a fresh chat.',
+    description: 'Open (or continue) this Codex thread\'s Visual chat with a request and structured session context (or a legacy brief and transcript). The first call opens a connect page in the browser; later calls continue in the same chat. Pass new: true to start a fresh chat.',
     inputSchema: {
       type: 'object',
       properties: {
         request: { type: 'string', description: 'What the user wants explained, e.g. "explain this commit".' },
-        brief: { type: 'string', description: 'The essentials Visual needs to start (under ~20,000 characters): key diffs or file excerpts with paths. No secrets.' },
+        context: CONTEXT_SCHEMA,
+        brief: { type: 'string', description: 'Legacy supporting details, at most 30000 characters. No secrets. Use context for request/summary history.' },
         new: { type: 'boolean', description: 'Start a new Visual chat instead of continuing this thread\'s chat.' },
       },
       required: ['request'],

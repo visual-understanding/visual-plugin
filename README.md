@@ -42,8 +42,7 @@ In any Claude Code session (in Codex, type `$visual` instead of `/visual`):
 - `/visual new …` starts a fresh Visual chat.
 
 ## What is sent to Visual
-- Your request, a short brief Claude Code writes for it (for example the commit's key changes), and the
-  recent text of your Claude Code conversation (tool output is left out).
+- Your current request, chronological user requests with factual summaries, and relevant supporting details prepared by your coding agent. The server uses Jev (TypeSafe) to select relevant context before Visual teaches. Older plugin versions send a brief and recent conversation text instead.
 - When Visual needs more detail it asks your session. Before each answer is sent you're asked to approve it
   (Claude Code: **"Is it OK to send Claude Code's answer to Visual?"**; Codex: its **Allow** prompt for
   `visual_reply`). Say no and Visual moves on.

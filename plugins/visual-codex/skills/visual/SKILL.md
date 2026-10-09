@@ -12,30 +12,39 @@ If the request starts with the word `new` or contains `--new`, the user wants a 
 word from the request and pass `new: true` in step 2. Otherwise a repeated `$visual` in this thread continues in
 the Visual chat it opened before, even if that tab or Codex was closed in between.
 
-## 1. Write the brief like a pull request description (a few minutes at most)
+## 1. Session context
 
-Visual explains it top-down, the way a teammate walks someone through a pull request: the big picture, then
-each piece and why it is needed. Your job is to hand over that description, accurately. Read what you need first
-(`git show`, `git log`, the files involved, this conversation), then write it in plain words. Keep it under ~8,000
-characters:
+The handoff contains chronological user request / factual summary pairs, followed by the current
+Visual request and the supporting details needed to explain it. Visual selects relevant pairs with Jev.
+The JSON context contract is:
 
-- **The request:** what they asked, and what they seem to want to understand if this conversation shows it.
-- **The change in one line:** what it achieves.
-- **Why:** the problem or reason behind it (from the commit message, history or conversation), and how things
-  behaved before versus after.
-- **The conceptual changes:** the two to four ideas that make up the change, each with why it was needed.
-- **The concrete changes, file by file:** for each file or module touched, what it is for, what changed in it, and
-  why that change is needed (which idea above it serves). For a plan document: each part of the plan, what it
-  touches, and why.
-- **Effects and risks:** what a user or teammate would notice, edge cases or follow-ups you verified.
-- **Key facts:** names, numbers, limits and timings you checked. Mark anything you are not sure of as unsure.
+```json
+{
+  "history": [
+    {"id": "r1", "request": "The user's original request", "summary": "Verified outcome, decisions, or unresolved work"},
+    {"id": "r2", "request": "A later correction", "summary": "What changed", "relatedTo": ["r1"]}
+  ],
+  "details": "Relevant verified facts, useful source excerpts, paths, and uncertainties for the current request",
+  "omitted": false
+}
+```
 
-No diffs or code listings, and no analogies or stories. Visual can ask this session for more at any time. Never put
-secrets, keys or `.env` contents in the brief.
+`history` contains the available session requests, ordered oldest first. IDs are unique. `relatedTo` links a correction or constraint to the
+requests it affects; those entries stay together during relevance selection. Each request and summary
+allows up to eight thousand characters. The total history budget is eighty thousand characters;
+older entries are omitted when it is exceeded. `details` allows thirty thousand characters.
+`omitted` indicates missing earlier history, including conversation compaction.
+
+- Don't replace the user's intent with a guessed goal or a prescribed lesson structure.
+- Don't present unverified outcomes or guesses as facts, or summarize planned work as completed.
+- Don't pre-filter the history by relevance; Jev handles selection.
+- Don't lose later corrections or constraints when summarizing earlier requests.
+- Don't include secrets, credentials, or `.env` contents.
+- Don't write the lesson, narration, or visual directions into the handoff.
 
 ## 2. Open Visual
 
-Call the `visual_open` tool with `request` (the user's request, without `$visual`), `brief` (the text from
+Call the `visual_open` tool with `request` (the user's request, without `$visual`), `context` (the structured context from
 step 1) and `new: true` only when the user asked for a fresh chat. It returns one line:
 
 - `Started a new Visual chat. Connect page: <url> …`: the browser opened the connect page. Tell the user in one

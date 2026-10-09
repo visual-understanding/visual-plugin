@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // visual-bridge: links a running Claude Code session to a Visual chat. Dependency-free, Node >= 22.
 //
-//   start --prompt <text> [--brief <file>] [--session <id>] [--cwd <dir>] [--new]   pair, open the browser, leave a daemon running;
+//   start --prompt <text> [--context <json-file>] [--brief <file>] [--session <id>] [--cwd <dir>] [--new]   pair, open the browser, leave a daemon running;
 //                                  run again in the same session, it continues in that session's Visual chat, even after the
 //                                  daemon stopped (the link in ~/.visual-bridge/links/<session>.json); --new forgets it and starts over
 //   watch [--id <bridgeId>]        one stdout line per question/event (for the Claude Code Monitor tool)
@@ -10,6 +10,7 @@
 //   status [--id <bridgeId>]       stop [--id <bridgeId>]   (stop keeps the link; `start --new` starts over)
 //   hook                           PreToolUse hook: asks the user before any answer is sent to Visual
 //   session-end                    SessionEnd hook: stops the daemon of the Claude Code session named on stdin
+import { readContext } from './context-data.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -177,15 +178,17 @@ function repoTitle(cwd) {
   return basename(resolve(cwd)) || 'Claude Code';
 }
 
-export function buildHello({ prompt, brief = '', cwd, session }) {
+export function buildHello({ prompt, brief = '', cwd, session, context }) {
+  const handoff = readContext(context);
   return {
     type: 'hello',
     version: 1,
     title: clip(repoTitle(cwd), LIMITS.title),
     cwd: clip(cwd, LIMITS.cwd),
     prompt: clip(String(prompt).replace(CONTROL, '').trim(), LIMITS.prompt),
-    brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'),
-    transcript: readTranscript({ cwd, session }),
+    brief: handoff ? handoff.details : clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'),
+    transcript: handoff ? '' : readTranscript({ cwd, session }),
+    ...(handoff ? { context: handoff } : {}),
   };
 }
 
@@ -249,8 +252,8 @@ function removeLink(session, linkId) {
   rmSync(linkPath(session), { force: true });
 }
 const newLink = () => ({ linkId: randomUUID(), secret: randomBytes(32).toString('base64url'), chatId: null, createdAt: new Date().toISOString() });
-const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '' }) =>
-  ({ type: 'rejoin', version: 1, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript });
+const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '', context }) =>
+  ({ type: 'rejoin', version: 1, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript, ...(context ? { context } : {}) });
 
 // ---------------------------------------------------------------- Claude Code process
 
@@ -435,7 +438,7 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
       if (s.link && mode === 'rejoin') return rejoinFrame(s.link, hello);
       return s.link ? { ...hello, link: { id: s.link.linkId, secret: s.link.secret } } : hello;
     }
-    if (s.link && (s.chatId || !s.secret)) return rejoinFrame(s.link, { title: hello.title, cwd: hello.cwd });
+    if (s.link && (s.chatId || !s.secret)) return rejoinFrame(s.link, { ...hello, prompt: '' });
     return { type: 'resume', bridgeId: s.bridgeId, secret: s.secret };
   }
 
@@ -517,13 +520,16 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
       }
       // A repeated `/visual`: the new request goes to the Visual chat this bridge already opened.
       if (req.method === 'POST' && url.pathname === '/request') {
-        const { prompt, brief = '' } = await readBody(req);
+        const { prompt, brief = '', context: rawContext, transcript = '' } = await readBody(req);
+        const context = readContext(rawContext);
+        if (typeof transcript !== 'string' || transcript.length > LIMITS.transcript) return reply(res, 400, { error: 'Invalid transcript.' });
         if (typeof prompt !== 'string' || !prompt.trim()) return reply(res, 400, { error: 'Empty request.' });
         if (!s.claimed) return reply(res, 409, { error: 'Visual has not connected yet.' });
         const id = randomBytes(12).toString('base64url');
         const ack = new Promise((done) => { requests.set(id, done); setTimeout(() => { requests.delete(id); done(null); }, 5000); });
-        if (!send({ type: 'request', id, prompt: clip(prompt.replace(CONTROL, '').trim(), LIMITS.prompt), brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]') }))
+        if (!send({ type: 'request', id, prompt: clip(prompt.replace(CONTROL, '').trim(), LIMITS.prompt), brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'), transcript, ...(context ? { context } : {}) }))
           return reply(res, 503, { error: 'Visual is not connected right now.' });
+        Object.assign(hello, { prompt, brief, transcript, context });
         lastActivity = Date.now();
         const result = await ack;
         log('request', id, result ? (result.open ? 'delivered' : 'queued') : 'no ack');
@@ -673,6 +679,11 @@ async function start(args) {
   }
   const session = typeof args.session === 'string' && ID_RE.test(args.session) && !args.session.includes('$') ? args.session
     : (process.env.CLAUDE_SESSION_ID && ID_RE.test(process.env.CLAUDE_SESSION_ID) ? process.env.CLAUDE_SESSION_ID : null);
+  let context;
+  if (typeof args.context === 'string') {
+    try { context = readContext(JSON.parse(readFileSync(args.context, 'utf8'))); } catch (error) { return fail(`cannot read context: ${error.message}`); }
+  }
+  const hello = buildHello({ prompt: args.prompt, brief, cwd, session, context });
   const previous = session ? sessionBridge(session) : null;
   let link = session ? loadLink(session) : null;
 
@@ -685,7 +696,7 @@ async function start(args) {
   } else if (previous) {
     // (1) Same Claude Code session, daemon running: ask in the Visual chat it already has.
     try {
-      const r = await api(previous, '/request', { method: 'POST', body: { prompt: args.prompt, brief } });
+      const r = await api(previous, '/request', { method: 'POST', body: { prompt: hello.prompt, brief: hello.brief, context: hello.context, transcript: hello.transcript } });
       return printReused(previous.bridgeId, r.chatUrl, r.open);
     } catch (error) {
       // Never claimed: nothing to come back to, so start afresh. Otherwise (not connected now) rejoin below.
@@ -695,7 +706,6 @@ async function start(args) {
     }
   }
 
-  const hello = buildHello({ prompt: args.prompt, brief, cwd, session });
   const parentPid = process.env.VISUAL_BRIDGE_PARENT_PID ? Number(process.env.VISUAL_BRIDGE_PARENT_PID) : claudeAncestor();
   if (link) {
     // (2) This session had a Visual chat: rejoin it with the new request, no connect page.
