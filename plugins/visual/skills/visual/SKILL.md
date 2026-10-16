@@ -1,8 +1,8 @@
 ---
 name: visual
-description: Open something from this Claude Code session in Visual (visualunderstanding.ai), the whiteboard tutor, e.g. "/visual explain this commit". Starts a local bridge so the Visual agent can ask this session follow-up questions, which you answer from the codebase.
+description: Open something from this Claude Code session in Visual (visualunderstanding.ai), the whiteboard tutor, e.g. "/visual explain this commit". Starts a local bridge so the Visual agent can ask this session follow-up questions, which you answer read-only from the codebase, and delivers user-approved messages back to this session.
 argument-hint: <what to explain, e.g. "explain this commit">
-allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs decline *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs status *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs stop *) Bash(git show *) Bash(git log *) Bash(git diff *) Bash(git status *) Monitor
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs decline *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs update-claim *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs update-status *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs status *) Bash(node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs stop *) Bash(git show *) Bash(git log *) Bash(git diff *) Bash(git status *) Monitor
 ---
 
 # Visual bridge
@@ -17,33 +17,42 @@ if that tab or Claude Code was closed in between.
 The bridge script is `${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs` (Node 22+, no install needed).
 Below, `BRIDGE` stands for `node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs`; write the full command every time.
 
-## 1. Write the brief like a pull request description (a few minutes at most)
+## 1. Session context
 
-Write it to a temp file, for example `/tmp/visual-brief-${CLAUDE_SESSION_ID}.md` (or your scratchpad directory).
+The handoff contains chronological user request / factual summary pairs, followed by the current
+Visual request and the supporting details needed to explain it. Visual selects relevant pairs with Jev.
+The JSON context contract is:
 
-Visual explains it top-down, the way a teammate walks someone through a pull request: the big picture, then
-each piece and why it is needed. Your job is to hand over that description, accurately. Read what you need first
-(`git show`, `git log`, the files involved, this conversation), then write it in plain words. Keep it under ~8,000
-characters:
+```json
+{
+  "history": [
+    {"id": "r1", "request": "The user's original request", "summary": "Verified outcome, decisions, or unresolved work"},
+    {"id": "r2", "request": "A later correction", "summary": "What changed", "relatedTo": ["r1"]}
+  ],
+  "details": "Relevant verified facts, useful source excerpts, paths, and uncertainties for the current request",
+  "omitted": false
+}
+```
 
-- **The request:** what they asked, and what they seem to want to understand if this conversation shows it.
-- **The change in one line:** what it achieves.
-- **Why:** the problem or reason behind it (from the commit message, history or conversation), and how things
-  behaved before versus after.
-- **The conceptual changes:** the two to four ideas that make up the change, each with why it was needed.
-- **The concrete changes, file by file:** for each file or module touched, what it is for, what changed in it, and
-  why that change is needed (which idea above it serves). For a plan document: each part of the plan, what it
-  touches, and why.
-- **Effects and risks:** what a user or teammate would notice, edge cases or follow-ups you verified.
-- **Key facts:** names, numbers, limits and timings you checked. Mark anything you are not sure of as unsure.
+`history` contains the available session requests, ordered oldest first. IDs are unique. `relatedTo` links a correction or constraint to the
+requests it affects; those entries stay together during relevance selection. Each request and summary
+allows up to eight thousand characters. The total history budget is eighty thousand characters;
+older entries are omitted when it is exceeded. `details` allows thirty thousand characters.
+`omitted` indicates missing earlier history, including conversation compaction.
 
-No diffs or code listings, and no analogies or stories. Visual can ask this session for more at any time. Never put
-secrets, keys or `.env` contents in the brief.
+- Don't replace the user's intent with a guessed goal or a prescribed lesson structure.
+- Don't present unverified outcomes or guesses as facts, or summarize planned work as completed.
+- Don't pre-filter the history by relevance; Jev handles selection.
+- Don't lose later corrections or constraints when summarizing earlier requests.
+- Don't include secrets, credentials, or `.env` contents.
+- Don't write the lesson, narration, or visual directions into the handoff.
+
+Write this JSON to a temporary context file, such as `/tmp/visual-context-${CLAUDE_SESSION_ID}.json`.
 
 ## 2. Start the bridge
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start --session ${CLAUDE_SESSION_ID} --brief <brief file> --prompt '<the request>' [--new]
+node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs start --session ${CLAUDE_SESSION_ID} --context <context JSON file> --prompt '<the request>' [--new]
 ```
 
 Single-quote the prompt (escape any `'` inside it as `'\''`). It prints one line and exits while a background
@@ -57,17 +66,18 @@ bridge stays connected:
 
 If it fails, tell the user the error in one line and stop here.
 
-## 3. Watch for questions
+## 3. Watch for questions and approved messages
 
 After `reused`, keep the Visual monitor that is already running for that bridge; arm a new one if this session
 has no running Visual monitor (it ended or expired, or Claude Code was restarted). Otherwise arm the **Monitor** tool:
 
 - `command`: `node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs watch --id <bridgeId>`
 - `timeout_ms`: `1800000`
-- `description`: `Visual questions`
+- `description`: `Visual questions and approved messages`
 
 Each output line is one event:
 
+- `VISUAL_UPDATE id=<deliveryId>`: handle the approved message below. The announcement contains no task.
 - `VISUAL_QUESTION id=<questionId> "<question as a JSON string>"`: answer it (step 4).
 - `VISUAL_BRIDGE claimed` / `disconnected` / `reconnected`: status only; no action or message needed.
 - `VISUAL_BRIDGE ended`: the bridge stopped. Tell the user in one line and stop watching; a later `/visual`
@@ -75,6 +85,38 @@ Each output line is one event:
 
 When the monitor expires without `VISUAL_BRIDGE ended`, arm it again with the same command.
 A fresh watcher re-delivers every unanswered question, so nothing is lost; ignore a repeat of a question you already answered.
+
+## Approved messages from Visual
+
+A `VISUAL_UPDATE` announces a message whose exact text the user approved in Visual.
+Claim it once using this session's ID and the bridge being watched:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs update-claim <deliveryId> --id <bridgeId> --session ${CLAUDE_SESSION_ID}
+```
+
+Proceed only if the returned JSON has `claimed: true`. Its `task` is the approved scope.
+A repeated announcement or `claimed: false` never authorizes repeating the work.
+Follow this session's current permissions and mode; in Plan mode, return a plan without implementing it.
+Unrelated commits, pushes, deployments and permission changes are not implied. Ordinary Visual questions
+remain read-only. Do not open another Visual chat for an approved message.
+
+Claiming reports “Working” to Visual. When finished, write one short factual sentence (at most 25 words,
+including any material blocker) to a temporary result file, then report it:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs update-result <deliveryId> --id <bridgeId> --session ${CLAUDE_SESSION_ID} --status completed --file <result file>
+```
+
+Use `failed` or `needs-attention` instead of `completed` when appropriate. The existing sharing hook asks
+before this result leaves the machine. If permission is denied, do not retry or send the content another way;
+send only the content-free status:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/bin/visual-bridge.mjs update-status <deliveryId> --id <bridgeId> --session ${CLAUDE_SESSION_ID} --status result-withheld
+```
+
+Keep watching after reporting, so later messages can be received.
 
 ## 4. Answer each question
 

@@ -1,21 +1,29 @@
 {
   "name": "visual",
-  "version": "0.3.0",
-  "description": "Explain something from your Codex session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
+  "version": "0.5.1",
+  "description": "Explain your work in Visual and send approved messages back to the same Codex thread.",
   "author": {
     "name": "Visual Understanding"
   },
   "homepage": "https://beta.visualunderstanding.ai",
-  "keywords": ["visual", "explain", "teaching", "whiteboard"],
+  "keywords": [
+    "visual",
+    "explain",
+    "teaching",
+    "whiteboard"
+  ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Visual",
     "shortDescription": "Explain your work on a narrated whiteboard",
-    "longDescription": "Opens a Visual chat about what you're doing in Codex, seeded with your request, a short brief and the session transcript. While the chat is open, the Visual agent can ask this session follow-up questions, which Codex answers read-only from your machine after you approve each answer.",
+    "longDescription": "Opens a narrated Visual whiteboard using this Codex session. Visual can ask read-only questions or show a message for your approval before sending it into this thread. Codex follows its existing permissions and mode. Answers and result summaries require local sharing approval.",
     "developerName": "Visual Understanding",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read"],
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
     "websiteURL": "https://beta.visualunderstanding.ai",
     "defaultPrompt": [
       "$visual explain this commit"

@@ -13,6 +13,8 @@
 //
 // Visual's questions reach the thread with `codex queue --thread <threadId> --message <text>`.
 // This file is self-contained: the plugin folder is copied into Codex's cache, so it imports nothing outside it.
+import { UpdateInbox } from './update-inbox.mjs';
+import { readContext, CONTEXT_SCHEMA } from './context-data.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -22,7 +24,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(import.meta.url);
-export const VERSION = '0.1.0';
+export const VERSION = '0.5.1';
 export const AGENT = 'codex';
 export const LIMITS = { title: 100, cwd: 500, prompt: 4000, brief: 30000, transcript: 80000, answer: 100000, question: 20000 };
 const ENTRY_LIMIT = 8000; // one transcript message, so a single paste can't crowd out the rest
@@ -232,8 +234,8 @@ function removeLink(key, linkId) {
   rmSync(linkPath(key), { force: true });
 }
 const newLink = () => ({ linkId: randomUUID(), secret: randomBytes(32).toString('base64url'), chatId: null, createdAt: new Date().toISOString() });
-const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '' }) =>
-  ({ type: 'rejoin', version: 1, agent: AGENT, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript });
+const rejoinFrame = (link, { title, cwd, threadId, prompt = '', brief = '', transcript = '', context }) =>
+  ({ type: 'rejoin', version: 1, agent: AGENT, capabilities: { updates: 1 }, threadId, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript, ...(context ? { context } : {}) });
 
 // ---------------------------------------------------------------- browser, codex queue
 
@@ -252,19 +254,21 @@ export const questionMessage = (id, question) =>
   `Visual asks (question ${id}): ${question}\nInvestigate read-only, then answer with visual_reply (question_id "${id}"), or visual_decline if it can't be shared.`;
 
 /** Queues a message into the live Codex thread. stdin must be /dev/null, or `codex` waits for it. */
-function codexQueue(threadId, message, onSpawn) {
+function codexQueue(threadId, message, onSpawn, onDone = () => {}) {
   const bin = process.env.CODEX_BIN || 'codex';
+  let settled = false;
+  const done = success => { if (!settled) { settled = true; onDone(success); } };
   let child;
   try { child = spawn(bin, ['queue', '--thread', threadId, '--message', message], { stdio: ['ignore', 'ignore', 'pipe'], env: process.env }); } catch (error) {
-    return log('codex queue failed:', error.message);
+    done(false); return log('codex queue failed:', error.message);
   }
   let stderr = '';
   const timer = setTimeout(() => { try { child.kill(); } catch {} }, QUEUE_TIMEOUT_MS);
   timer.unref?.();
   child.stderr.on('data', (d) => { if (stderr.length < 2000) stderr += d; });
   child.on('spawn', onSpawn);
-  child.on('error', (error) => { clearTimeout(timer); log('codex queue failed:', error.message); });
-  child.on('exit', (code) => { clearTimeout(timer); if (code) log(`codex queue exited ${code}:`, clip(stderr.trim().replace(/\s+/g, ' '), 300)); });
+  child.on('error', (error) => { done(false); clearTimeout(timer); log('codex queue failed:', error.message); });
+  child.on('exit', (code) => { done(code === 0); clearTimeout(timer); if (code) log(`codex queue exited ${code}:`, clip(stderr.trim().replace(/\s+/g, ' '), 300)); });
 }
 
 // ---------------------------------------------------------------- one thread's connection to Visual
@@ -274,11 +278,19 @@ function codexQueue(threadId, message, onSpawn) {
 class Connection {
   constructor({ threadId, hello, link, mode, onEnd }) {
     Object.assign(this, { threadId, hello, link, mode, onEnd });
+    this.hello = { ...hello, threadId };
     this.key = linkKey(threadId);
     this.bridgeId = null; this.secret = null; this.claimUrl = null; this.claimed = false; this.chatId = null;
     this.state = 'connecting'; this.ended = false; this.fatal = null;
     this.ws = null; this.attempt = 0; this.downSince = null; this.lastActivity = Date.now();
     this.requests = new Map(); this.questions = new Map(); this.outbox = [];
+    this.updates = link ? new UpdateInbox({ path: join(stateDir(), 'updates', `${threadId}-${link.linkId}.json`), bridgeId: link.linkId, threadId,
+      direct: true, send: frame => this.send(frame), queue: (id, done, update) => codexQueue(threadId,
+        `Approved Visual message:
+
+${update.task}
+
+[Delivery ID: ${id}. Follow this chat’s current mode and permissions. Report progress with visual_update_status and one factual outcome sentence (at most 25 words, including any material blocker; no implementation or test rundown) with visual_update_result using this ID. No claim step is needed.]`, () => {}, done) }) : null;
     this.ready = new Promise((done) => { this.settle = done; });
     this.pairTimer = setTimeout(() => this.end(`Visual did not answer within ${PAIR_TIMEOUT_MS / 1000} s (${wsUrl()}).`), PAIR_TIMEOUT_MS);
     this.idleTimer = setInterval(() => { if (Date.now() - this.lastActivity > IDLE_MS) this.stop('idle for 3 hours'); }, 60_000);
@@ -367,6 +379,7 @@ class Connection {
       case 'chat':
         this.setChat(msg.chatId);
         return;
+      case 'update': this.lastActivity = Date.now(); return this.updates?.receive(msg.update, this.chatId);
       case 'ask': return this.onAsk(msg);
       case 'request-ack': {
         const done = this.requests.get(msg.id);
@@ -385,6 +398,10 @@ class Connection {
   // approval (visual_reply asks first), so it waits up to 5 minutes.
   onAsk(msg) {
     if (!ID_RE.test(msg.id ?? '') || typeof msg.question !== 'string') return log('bad ask frame');
+    if (!msg.question.trim() || /^(null|undefined)$/i.test(msg.question.trim())) {
+      this.send({ type: 'answer', id: msg.id, text: 'No question was delivered to Codex because the question text was empty or a placeholder. Continue without this lookup; do not retry it.' });
+      return;
+    }
     this.lastActivity = Date.now();
     if (this.questions.has(msg.id)) return;
     const question = clip(msg.question, LIMITS.question);
@@ -409,18 +426,19 @@ class Connection {
   }
 
   /** A new request for the chat this connection already has; resolves with the ack or null. */
-  request(prompt, brief) {
+  request(prompt, brief, context, transcript) {
     const id = randomBytes(12).toString('base64url');
     const ack = new Promise((done) => {
       this.requests.set(id, done);
       setTimeout(() => { if (this.requests.delete(id)) done(null); }, 5000).unref?.();
     });
-    if (!this.send({ type: 'request', id, prompt, brief })) { this.requests.delete(id); return Promise.resolve(null); }
+    if (!this.send({ type: 'request', id, prompt, brief, ...(context ? { context } : {}), transcript })) { this.requests.delete(id); return Promise.resolve(null); }
+    Object.assign(this.hello, { prompt, brief, context, transcript });
     this.lastActivity = Date.now();
     return ack;
   }
 
-  flush() { while (this.outbox.length && this.send(this.outbox[0])) this.outbox.shift(); }
+  flush() { while (this.outbox.length && this.send(this.outbox[0])) this.outbox.shift(); this.updates?.flush(); this.send({ type: 'update-sync' }); }
 
   onClose(sock, code, reason) {
     if (sock !== this.ws || this.ended) return;
@@ -441,10 +459,10 @@ class Connection {
   firstFrame() {
     if (!this.bridgeId) {
       if (this.link && this.mode === 'rejoin') return rejoinFrame(this.link, this.hello);
-      const hello = { type: 'hello', version: 1, agent: AGENT, ...this.hello };
+      const hello = { type: 'hello', version: 1, agent: AGENT, capabilities: { updates: 1 }, ...this.hello };
       return this.link ? { ...hello, link: { id: this.link.linkId, secret: this.link.secret } } : hello;
     }
-    if (this.link && (this.chatId || !this.secret)) return rejoinFrame(this.link, { title: this.hello.title, cwd: this.hello.cwd });
+    if (this.link && (this.chatId || !this.secret)) return rejoinFrame(this.link, { ...this.hello, prompt: '' });
     return { type: 'resume', bridgeId: this.bridgeId, secret: this.secret };
   }
 
@@ -471,13 +489,13 @@ class Connection {
 }
 
 /** Best effort: rejoins an old link just to say `bye`, so Visual forgets it. */
-function forgetLink(link, { title, cwd }) {
+function forgetLink(link, { title, cwd, threadId }) {
   return new Promise((done) => {
     let sock;
     const finish = () => { clearTimeout(timer); try { sock?.close(); } catch {} done(); };
     const timer = setTimeout(finish, 5000);
     try { sock = new WebSocket(wsUrl()); } catch { return finish(); }
-    sock.onopen = () => sock.send(JSON.stringify(rejoinFrame(link, { title, cwd })));
+    sock.onopen = () => sock.send(JSON.stringify(rejoinFrame(link, { title, cwd, threadId })));
     sock.onmessage = (event) => {
       let msg;
       try { msg = JSON.parse(String(event.data)); } catch { return; }
@@ -512,23 +530,29 @@ async function visualOpen(threadId, args) {
   const prompt = clip(cleanText(args.request), LIMITS.prompt);
   if (!prompt) throw new Error('visual_open needs a non-empty "request".');
   if (args.brief !== undefined && typeof args.brief !== 'string') throw new Error('"brief" must be text.');
-  const brief = clip(String(args.brief ?? '').replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]');
+  const handoff = readContext(args.context);
+  const brief = handoff ? handoff.details : clip(String(args.brief ?? '').replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]');
   const key = linkKey(threadId);
   const context = sessionContext(threadId);
+  const transcript = handoff ? '' : context.transcript;
   let conn = liveConnection(threadId);
   let link = loadLink(key);
 
   if (args.new === true) {
+    if (link) {
+      const inbox = conn?.updates || new UpdateInbox({ path: join(stateDir(), 'updates', `${threadId}-${link.linkId}.json`), bridgeId: link.linkId, threadId, send() {}, queue() {} });
+      if (Object.values(inbox.rows).some(row => !row.report?.finished)) throw new Error('Finish or resolve the active Visual update before starting a new chat.');
+    }
     // Start over: the old chat's link is said goodbye to (by the live connection, else by a one-shot rejoin) and deleted.
     const sent = conn ? conn.stop('replaced by a new chat', { forget: true }) : false;
     if (conn) await conn.closed();
-    if (link && !(sent && conn?.bridgeId === link.linkId)) await forgetLink(link, { title: context.title, cwd: context.cwd });
+    if (link && !(sent && conn?.bridgeId === link.linkId)) await forgetLink(link, { title: context.title, cwd: context.cwd, threadId });
     if (link) removeLink(key, link.linkId);
     link = null;
   } else if (conn) {
     // (1) This thread's connection is live: ask in the Visual chat it already has.
     if (conn.connected && conn.claimed) {
-      const ack = await conn.request(prompt, brief);
+      const ack = await conn.request(prompt, brief, handoff, transcript);
       if (ack?.accepted) return reusedText(conn.chatId || ack.chatId, !!ack.open);
     }
     // Never claimed: nothing to come back to, so start afresh. Otherwise (not connected now) rejoin below.
@@ -538,7 +562,7 @@ async function visualOpen(threadId, args) {
     if (forget && link?.linkId === conn.bridgeId) { removeLink(key, link.linkId); link = null; }
   }
 
-  const hello = { title: context.title, cwd: context.cwd, prompt, brief, transcript: context.transcript };
+  const hello = { title: context.title, cwd: context.cwd, prompt, brief, transcript, ...(handoff ? { context: handoff } : {}) };
   if (link) {
     // (2) This thread had a Visual chat: rejoin it with the new request, no connect page.
     const rejoining = track(new Connection({ threadId, hello, link, mode: 'rejoin', onEnd: untrack }));
@@ -577,24 +601,60 @@ function visualDecline(threadId, args) {
 function visualStatus(threadId) {
   const conn = liveConnection(threadId);
   const link = loadLink(linkKey(threadId));
-  if (!conn) return JSON.stringify({ connection: 'none', linked: !!link, chatUrl: link?.chatId ? `${webUrl()}/chat/${link.chatId}` : null });
+  if (!conn) {
+    const inbox = link ? new UpdateInbox({ path: join(stateDir(), 'updates', `${threadId}-${link.linkId}.json`), bridgeId: link.linkId, threadId, send() {}, queue() {} }) : null;
+    return JSON.stringify({ connection: 'none', linked: !!link, chatUrl: link?.chatId ? `${webUrl()}/chat/${link.chatId}` : null,
+      updates: Object.values(inbox?.rows || {}).map(row => ({ id: row.update.id, title: row.update.title, status: row.report?.status || 'needs-attention' })) });
+  }
   return JSON.stringify({
     connection: conn.state, claimed: conn.claimed, linked: !!conn.link,
     chatUrl: conn.chatId ? `${webUrl()}/chat/${conn.chatId}` : null, claimUrl: conn.claimed ? null : conn.claimUrl,
+    updates: Object.values(conn.updates?.rows || {}).map(row => ({ id: row.update.id, title: row.update.title, status: row.report?.status || 'needs-attention' })),
     unanswered: [...conn.questions.values()].filter((q) => !q.answered).map((q) => q.id),
   });
 }
 
+async function updateTool(threadId, args, action) {
+  if (typeof args.request_id !== 'string' || !UUID_RE.test(args.request_id)) throw new Error('A valid request_id is required.');
+  let conn = liveConnection(threadId);
+  if (!conn) {
+    const link = loadLink(linkKey(threadId));
+    if (!link) throw new Error('Reconnect this thread to Visual first.');
+    const context = sessionContext(threadId);
+    conn = track(new Connection({ threadId, link, mode: 'rejoin', hello: { title: context.title, cwd: context.cwd }, onEnd: untrack }));
+    await conn.ready;
+  }
+  if (!conn.updates) throw new Error('This connection does not support updates.');
+  if (action === 'claim') {
+    if (!conn.connected) throw new Error('Reconnect this Codex thread before claiming an update.');
+    return JSON.stringify(conn.updates.claim(args.request_id));
+  }
+  if (action === 'status') return JSON.stringify(conn.updates.status(args.request_id, args.status));
+  return JSON.stringify(conn.updates.result(args.request_id, args.status, args.summary));
+}
+
 export const TOOLS = [
+  ...['claim', 'status', 'result'].map(action => ({
+    name: `visual_update_${action}`,
+    description: action === 'claim' ? 'Retrieve and claim a task explicitly confirmed by the user in Visual. Only execute when claimed is true.'
+      : action === 'status' ? 'Report a fixed progress status for the claimed Visual task; sends no source content.'
+      : 'Return one short factual outcome sentence to Visual (at most 25 words, including any material blocker; no implementation or test rundown). This shares the summary off this machine and requires approval.',
+    inputSchema: { type: 'object', properties: { request_id: { type: 'string' },
+      ...(action !== 'claim' ? { status: { type: 'string', enum: action === 'status' ? ['working', 'needs-attention', 'result-withheld'] : ['completed', 'failed', 'needs-attention'] } } : {}),
+      ...(action === 'result' ? { summary: { type: 'string', minLength: 1, maxLength: 16000 } } : {}) },
+      required: ['request_id', ...(action !== 'claim' ? ['status'] : []), ...(action === 'result' ? ['summary'] : [])], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: action !== 'claim' },
+  })),
   {
     name: 'visual_open',
     title: 'Open in Visual',
-    description: 'Open (or continue) this Codex thread\'s Visual chat with a request, a short brief and the thread transcript. The first call opens a connect page in the browser; later calls continue in the same chat. Pass new: true to start a fresh chat.',
+    description: 'Open (or continue) this Codex thread\'s Visual chat with a request and structured session context (or a legacy brief and transcript). The first call opens a connect page in the browser; later calls continue in the same chat. Pass new: true to start a fresh chat.',
     inputSchema: {
       type: 'object',
       properties: {
         request: { type: 'string', description: 'What the user wants explained, e.g. "explain this commit".' },
-        brief: { type: 'string', description: 'The essentials Visual needs to start (under ~20,000 characters): key diffs or file excerpts with paths. No secrets.' },
+        context: CONTEXT_SCHEMA,
+        brief: { type: 'string', description: 'Legacy supporting details, at most 30000 characters. No secrets. Use context for request/summary history.' },
         new: { type: 'boolean', description: 'Start a new Visual chat instead of continuing this thread\'s chat.' },
       },
       required: ['request'],
@@ -638,7 +698,7 @@ export const TOOLS = [
   },
 ];
 
-const HANDLERS = { visual_open: visualOpen, visual_reply: visualReply, visual_decline: visualDecline, visual_status: visualStatus };
+const HANDLERS = { visual_update_claim: (t,a) => updateTool(t,a,'claim'), visual_update_status: (t,a) => updateTool(t,a,'status'), visual_update_result: (t,a) => updateTool(t,a,'result'), visual_open: visualOpen, visual_reply: visualReply, visual_decline: visualDecline, visual_status: visualStatus };
 
 /** The Codex thread of a tools/call: `_meta.threadId` (Codex also sends it in x-codex-turn-metadata). */
 export function threadOf(params) {
@@ -676,7 +736,7 @@ async function handle(message) {
         protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[1],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'visual', title: 'Visual', version: VERSION },
-        instructions: 'Visual (visualunderstanding.ai) explains things from this Codex thread on a whiteboard. Use the $visual skill; messages starting "Visual asks (question <id>)" are questions from Visual, answered with visual_reply or visual_decline.',
+        instructions: 'Visual (visualunderstanding.ai) explains things from this Codex thread on a whiteboard. Use the $visual skill; messages starting "Visual asks (question <id>)" are questions from Visual, answered read-only with visual_reply or visual_decline. Approved Visual messages contain the exact text the user approved. Handle them in this thread and return one short factual outcome sentence (at most 25 words, including any material blocker; no implementation or test rundown) with visual_update_result; no claim step is needed. Legacy Visual update ID announcements still require visual_update_claim.',
       });
     }
     case 'ping': return reply({});

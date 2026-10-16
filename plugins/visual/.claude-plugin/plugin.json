@@ -1,11 +1,16 @@
 {
   "name": "visual",
   "displayName": "Visual",
-  "version": "0.6.0",
-  "description": "Explain something from your Claude Code session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
+  "version": "0.8.0",
+  "description": "Explain your work in Visual and receive approved messages back in the same Claude Code session.",
   "author": {
     "name": "Visual Understanding"
   },
   "homepage": "https://beta.visualunderstanding.ai",
-  "keywords": ["visual", "explain", "teaching", "whiteboard"]
+  "keywords": [
+    "visual",
+    "explain",
+    "teaching",
+    "whiteboard"
+  ]
 }

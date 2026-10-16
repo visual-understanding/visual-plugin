@@ -8,8 +8,8 @@
     {
       "name": "visual",
       "source": "./plugins/visual",
-      "description": "Explain something from your Claude Code session in Visual: opens a Visual chat seeded with the session, and answers the Visual agent's follow-up questions from your machine.",
-      "version": "0.6.0"
+      "description": "Explain your work in Visual, answer read-only questions, and receive messages you approve back in the same Claude Code session.",
+      "version": "0.8.0"
     }
   ]
 }

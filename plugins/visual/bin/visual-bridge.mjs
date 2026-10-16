@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // visual-bridge: links a running Claude Code session to a Visual chat. Dependency-free, Node >= 22.
 //
-//   start --prompt <text> [--brief <file>] [--session <id>] [--cwd <dir>] [--new]   pair, open the browser, leave a daemon running;
+//   start --prompt <text> [--context <json-file>] [--brief <file>] [--session <id>] [--cwd <dir>] [--new]   pair, open the browser, leave a daemon running;
 //                                  run again in the same session, it continues in that session's Visual chat, even after the
 //                                  daemon stopped (the link in ~/.visual-bridge/links/<session>.json); --new forgets it and starts over
 //   watch [--id <bridgeId>]        one stdout line per question/event (for the Claude Code Monitor tool)
@@ -10,6 +10,8 @@
 //   status [--id <bridgeId>]       stop [--id <bridgeId>]   (stop keeps the link; `start --new` starts over)
 //   hook                           PreToolUse hook: asks the user before any answer is sent to Visual
 //   session-end                    SessionEnd hook: stops the daemon of the Claude Code session named on stdin
+import { readContext } from './context-data.mjs';
+import { UpdateInbox } from './update-inbox.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -177,15 +179,19 @@ function repoTitle(cwd) {
   return basename(resolve(cwd)) || 'Claude Code';
 }
 
-export function buildHello({ prompt, brief = '', cwd, session }) {
+export function buildHello({ prompt, brief = '', cwd, session, context }) {
+  const handoff = readContext(context);
   return {
     type: 'hello',
     version: 1,
+    agent: 'claude-code',
+    ...(SESSION_RE.test(session ?? '') && session.length <= 100 ? { threadId: session, capabilities: { updates: 1 } } : {}),
     title: clip(repoTitle(cwd), LIMITS.title),
     cwd: clip(cwd, LIMITS.cwd),
     prompt: clip(String(prompt).replace(CONTROL, '').trim(), LIMITS.prompt),
-    brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'),
-    transcript: readTranscript({ cwd, session }),
+    brief: handoff ? handoff.details : clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'),
+    transcript: handoff ? '' : readTranscript({ cwd, session }),
+    ...(handoff ? { context: handoff } : {}),
   };
 }
 
@@ -249,8 +255,8 @@ function removeLink(session, linkId) {
   rmSync(linkPath(session), { force: true });
 }
 const newLink = () => ({ linkId: randomUUID(), secret: randomBytes(32).toString('base64url'), chatId: null, createdAt: new Date().toISOString() });
-const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '' }) =>
-  ({ type: 'rejoin', version: 1, linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript });
+const rejoinFrame = (link, { title, cwd, prompt = '', brief = '', transcript = '', context, threadId }) =>
+  ({ type: 'rejoin', version: 1, agent: 'claude-code', ...(threadId ? { threadId, capabilities: { updates: 1 } } : {}), linkId: link.linkId, secret: link.secret, title, cwd, prompt, brief, transcript, ...(context ? { context } : {}) });
 
 // ---------------------------------------------------------------- Claude Code process
 
@@ -301,10 +307,18 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
   const emit = (event) => { events.push({ seq: ++seq, event }); log('event', event); notify(); };
   const send = (frame) => { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; };
   const report = (message) => { try { process.send?.(message); } catch {} };
+  // The existing Monitor wakes Claude. A claim exposes only browser-approved text,
+  // once, to the originating session; questions retain their read-only path.
+  const inbox = link && session ? new UpdateInbox({
+    path: join(stateDir(), 'updates', `claude-${session}-${link.linkId}.json`),
+    bridgeId: link.linkId, threadId: session, send,
+    queue: (_id, done) => { done(true); notify(); },
+  }) : null;
+  const syncUpdates = () => { inbox?.flush(); if (inbox) send({ type: 'update-sync' }); };
 
   function writeState() {
     writePrivate(statePath(s.bridgeId), JSON.stringify({ bridgeId: s.bridgeId, pid: process.pid, port: server.address().port, token, title: hello.title,
-      claimUrl: s.claimUrl, session, cwd: hello.cwd, chatId: s.chatId, startedAt: s.startedAt }, null, 2));
+      claimUrl: s.claimUrl, session, cwd: hello.cwd, chatId: s.chatId, startedAt: s.startedAt, updatesSupported: !!inbox }, null, 2));
     writePrivate(join(stateDir(), 'current'), s.bridgeId);
   }
 
@@ -373,6 +387,7 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
           report({ type: 'rejoined', bridgeId: s.bridgeId, chatId: s.chatId, open: !!msg.open });
         } else emit('reconnected');
         while (outbox.length && send(outbox[0])) outbox.shift();
+        syncUpdates();
         return;
       }
       case 'resumed':
@@ -383,6 +398,7 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
         if (msg.claimed && !s.claimed) { s.claimed = true; emit('claimed'); }
         setChat(msg.chatId);
         while (outbox.length && send(outbox[0])) outbox.shift();
+        syncUpdates();
         return;
       case 'claimed':
         lastActivity = Date.now();
@@ -398,6 +414,13 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
       }
       case 'chat':
         setChat(msg.chatId);
+        syncUpdates();
+        return;
+      case 'update':
+        lastActivity = Date.now();
+        if (s.link && inbox) inbox.receive(msg.update, s.chatId);
+        return;
+      case 'update-ack':
         return;
       case 'request-ack': {
         const done = requests.get(msg.id);
@@ -435,7 +458,7 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
       if (s.link && mode === 'rejoin') return rejoinFrame(s.link, hello);
       return s.link ? { ...hello, link: { id: s.link.linkId, secret: s.link.secret } } : hello;
     }
-    if (s.link && (s.chatId || !s.secret)) return rejoinFrame(s.link, { title: hello.title, cwd: hello.cwd });
+    if (s.link && (s.chatId || !s.secret)) return rejoinFrame(s.link, { ...hello, prompt: '' });
     return { type: 'resume', bridgeId: s.bridgeId, secret: s.secret };
   }
 
@@ -466,6 +489,7 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
   const status = () => ({
     bridgeId: s.bridgeId, title: hello.title, connection: s.conn, claimed: s.claimed, claimUrl: s.claimUrl, chatId: s.chatId, linked: !!s.link,
     unanswered: [...questions.values()].filter((q) => !q.answered).map((q) => q.id), startedAt: s.startedAt,
+    updates: Object.values(inbox?.rows || {}).map(row => ({ id: row.update.id, status: row.report?.status, claimed: row.claimed })),
   });
 
   function poll(req, res, url) {
@@ -478,12 +502,14 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
     const deliver = () => {
       const now = Date.now();
       const qs = [...questions.values()].filter((q) => !q.answered && !w.delivered.has(q.id) && now - q.at < (q.approving ? APPROVAL_TTL_MS : QUESTION_TTL_MS));
+      const approved = Object.values(inbox?.rows || {}).filter(row => !row.claimed && !row.report?.finished && !w.delivered.has(row.update.id));
       const evs = events.filter((e) => e.seq > w.seen).map((e) => e.event);
-      if (!qs.length && !evs.length && !s.ended) return false;
+      if (!qs.length && !approved.length && !evs.length && !s.ended) return false;
       for (const q of qs) w.delivered.add(q.id);
+      for (const row of approved) w.delivered.add(row.update.id);
       w.seen = seq;
       handedOut = Math.max(handedOut, seq);
-      reply(res, 200, { questions: qs.map(({ id, question }) => ({ id, question })), events: evs, ended: s.ended });
+      reply(res, 200, { questions: qs.map(({ id, question }) => ({ id, question })), updates: approved.map(row => ({ id: row.update.id })), events: evs, ended: s.ended });
       return true;
     };
     if (deliver()) return;
@@ -501,6 +527,14 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
     try {
       if (req.method === 'GET' && url.pathname === '/status') return reply(res, 200, status());
       if (req.method === 'GET' && url.pathname === '/poll') return poll(req, res, url);
+      const action = url.pathname.match(/^\/update\/(claim|status|result)$/)?.[1];
+      if (req.method === 'POST' && action) {
+        const body = await readBody(req);
+        if (!inbox || !session || body.session !== session) return reply(res, 403, { error: 'This update belongs to another Claude Code session.' });
+        lastActivity = Date.now();
+        const result = action === 'claim' ? inbox.claim(body.id) : action === 'status' ? inbox.status(body.id, body.status) : inbox.result(body.id, body.status, body.summary);
+        return reply(res, 200, result);
+      }
       if (req.method === 'POST' && url.pathname === '/reply') {
         const { id, text } = await readBody(req);
         const q = questions.get(id);
@@ -517,13 +551,16 @@ function runDaemon({ hello, session = null, link = null, mode = 'hello', parentP
       }
       // A repeated `/visual`: the new request goes to the Visual chat this bridge already opened.
       if (req.method === 'POST' && url.pathname === '/request') {
-        const { prompt, brief = '' } = await readBody(req);
+        const { prompt, brief = '', context: rawContext, transcript = '' } = await readBody(req);
+        const context = readContext(rawContext);
+        if (typeof transcript !== 'string' || transcript.length > LIMITS.transcript) return reply(res, 400, { error: 'Invalid transcript.' });
         if (typeof prompt !== 'string' || !prompt.trim()) return reply(res, 400, { error: 'Empty request.' });
         if (!s.claimed) return reply(res, 409, { error: 'Visual has not connected yet.' });
         const id = randomBytes(12).toString('base64url');
         const ack = new Promise((done) => { requests.set(id, done); setTimeout(() => { requests.delete(id); done(null); }, 5000); });
-        if (!send({ type: 'request', id, prompt: clip(prompt.replace(CONTROL, '').trim(), LIMITS.prompt), brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]') }))
+        if (!send({ type: 'request', id, prompt: clip(prompt.replace(CONTROL, '').trim(), LIMITS.prompt), brief: clip(String(brief).replace(CONTROL, ''), LIMITS.brief, '\n[… brief truncated …]'), transcript, ...(context ? { context } : {}) }))
           return reply(res, 503, { error: 'Visual is not connected right now.' });
+        Object.assign(hello, { prompt, brief, transcript, context });
         lastActivity = Date.now();
         const result = await ack;
         log('request', id, result ? (result.open ? 'delivered' : 'queued') : 'no ack');
@@ -637,13 +674,13 @@ function printReused(bridgeId, chatUrl, open) {
 }
 
 /** Best effort: rejoins an old link just to say `bye`, so Visual forgets it. */
-function forgetLink(link, { title, cwd }) {
+function forgetLink(link, { title, cwd, threadId }) {
   return new Promise((done) => {
     let sock;
     const finish = () => { clearTimeout(timer); try { sock?.close(); } catch {} done(); };
     const timer = setTimeout(finish, 5000);
     try { sock = new WebSocket(wsUrl()); } catch { return finish(); }
-    sock.onopen = () => sock.send(JSON.stringify(rejoinFrame(link, { title, cwd })));
+    sock.onopen = () => sock.send(JSON.stringify(rejoinFrame(link, { title, cwd, threadId })));
     sock.onmessage = (event) => {
       let msg;
       try { msg = JSON.parse(String(event.data)); } catch { return; }
@@ -673,19 +710,27 @@ async function start(args) {
   }
   const session = typeof args.session === 'string' && ID_RE.test(args.session) && !args.session.includes('$') ? args.session
     : (process.env.CLAUDE_SESSION_ID && ID_RE.test(process.env.CLAUDE_SESSION_ID) ? process.env.CLAUDE_SESSION_ID : null);
+  let context;
+  if (typeof args.context === 'string') {
+    try { context = readContext(JSON.parse(readFileSync(args.context, 'utf8'))); } catch (error) { return fail(`cannot read context: ${error.message}`); }
+  }
+  const hello = buildHello({ prompt: args.prompt, brief, cwd, session, context });
   const previous = session ? sessionBridge(session) : null;
   let link = session ? loadLink(session) : null;
 
   if (args.new) {
     // Start over: the old chat's link is said goodbye to (by its daemon, else by a one-shot rejoin) and deleted.
     const stopped = previous ? await stopDaemon(previous, { forget: true, reason: 'replaced by a new chat' }) : { sent: false };
-    if (link && !(stopped.sent && previous.bridgeId === link.linkId)) await forgetLink(link, { title: clip(repoTitle(cwd), LIMITS.title), cwd: clip(cwd, LIMITS.cwd) });
+    if (link && !(stopped.sent && previous.bridgeId === link.linkId)) await forgetLink(link, { title: clip(repoTitle(cwd), LIMITS.title), cwd: clip(cwd, LIMITS.cwd), threadId: hello.threadId });
     if (link) removeLink(session, link.linkId);
     link = null;
+  } else if (previous && hello.capabilities?.updates && !previous.updatesSupported) {
+    // An installed plugin update must also replace its old, read-only daemon.
+    await stopDaemon(previous, { reason: 'upgrading the Visual bridge' });
   } else if (previous) {
     // (1) Same Claude Code session, daemon running: ask in the Visual chat it already has.
     try {
-      const r = await api(previous, '/request', { method: 'POST', body: { prompt: args.prompt, brief } });
+      const r = await api(previous, '/request', { method: 'POST', body: { prompt: hello.prompt, brief: hello.brief, context: hello.context, transcript: hello.transcript } });
       return printReused(previous.bridgeId, r.chatUrl, r.open);
     } catch (error) {
       // Never claimed: nothing to come back to, so start afresh. Otherwise (not connected now) rejoin below.
@@ -695,7 +740,6 @@ async function start(args) {
     }
   }
 
-  const hello = buildHello({ prompt: args.prompt, brief, cwd, session });
   const parentPid = process.env.VISUAL_BRIDGE_PARENT_PID ? Number(process.env.VISUAL_BRIDGE_PARENT_PID) : claudeAncestor();
   if (link) {
     // (2) This session had a Visual chat: rejoin it with the new request, no connect page.
@@ -734,6 +778,7 @@ async function watch(args) {
       const question = JSON.stringify(q.question).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
       await printLine(`VISUAL_QUESTION id=${q.id} ${question}`);
     }
+    for (const update of r.updates ?? []) await printLine(`VISUAL_UPDATE id=${update.id}`);
     if (r.ended) return printLine('VISUAL_BRIDGE ended');
   }
 }
@@ -772,6 +817,20 @@ async function declineCommand(args) {
   } catch (error) { fail(error.message); }
 }
 
+async function updateCommand(args) {
+  const id = args._[1], action = args._[0].slice('update-'.length);
+  if (!UUID_RE.test(id ?? '') || !args.id || !SESSION_RE.test(args.session ?? '')) return fail('updates require a delivery ID, --id <bridgeId> and --session <current Claude session id>.');
+  const state = loadState(args.id);
+  if (!state || state.session !== args.session) return fail('No bridge for this Claude Code session.');
+  let summary;
+  if (action === 'result') {
+    if (!args.file) return fail('update-result requires --file <summary file>.');
+    try { summary = readFileSync(args.file, 'utf8'); } catch (error) { return fail(error.message); }
+  }
+  try { await printLine(JSON.stringify(await api(state, `/update/${action}`, { method: 'POST', body: { id, session: args.session, status: args.status, summary } }))); }
+  catch (error) { fail(error.message); }
+}
+
 // Matches this script's `reply` subcommand in a Bash command, returning the question and bridge ids.
 export function replyInCommand(command) {
   if (typeof command !== 'string') return null;
@@ -794,11 +853,12 @@ async function hookCommand() {
   let input = null;
   try { input = JSON.parse(await readStdin()); } catch { return; }
   const target = input?.tool_name === 'Bash' ? replyInCommand(input.tool_input?.command) : null;
-  if (!target || !askBeforeSending()) return;
-  const state = loadState(target.bridgeId ?? undefined);
+  const result = input?.tool_name === 'Bash' && /visual-bridge\.mjs["']?\s+update-result\s/.test(input.tool_input?.command || '');
+  if ((!target && !result) || !askBeforeSending()) return;
+  const state = target ? loadState(target.bridgeId ?? undefined) : null;
   if (state) await api(state, '/approving', { method: 'POST', body: { id: target.questionId }, timeoutMs: 2000 }).catch(() => {});
   await printLine(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask',
-    permissionDecisionReason: "Is it OK to send Claude Code's answer to Visual?" } }));
+    permissionDecisionReason: result ? "Is it OK to send Claude Code's result to Visual?" : "Is it OK to send Claude Code's answer to Visual?" } }));
 }
 
 async function statusCommand(args) {
@@ -829,7 +889,8 @@ async function sessionEndCommand() {
 
 async function main(argv) {
   const args = parseArgs(argv);
-  const commands = { start, watch, reply: replyCommand, decline: declineCommand, status: statusCommand, stop: stopCommand, hook: hookCommand, 'session-end': sessionEndCommand };
+  const commands = { start, watch, reply: replyCommand, decline: declineCommand, status: statusCommand, stop: stopCommand, hook: hookCommand, 'session-end': sessionEndCommand,
+    'update-claim': updateCommand, 'update-status': updateCommand, 'update-result': updateCommand };
   const command = args._[0];
   if (command === 'daemon') {
     if (!process.send) return fail('daemon is started by `start`.');
